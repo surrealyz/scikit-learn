@@ -42,6 +42,8 @@ cdef class Splitter:
     cdef public SIZE_t max_features      # Number of features to test
     cdef public SIZE_t min_samples_leaf  # Min samples in a leaf
     cdef public double min_weight_leaf   # Minimum weight in a leaf
+    cdef public double eps               # Epsilon for robust splitter
+    cdef public int verbose              # Verbosity for robust splitting
 
     cdef object random_state             # Random state
     cdef UINT32_t rand_r_state           # sklearn_rand_r random number state

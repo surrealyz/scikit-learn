@@ -21,6 +21,7 @@ from libc.stdlib cimport free
 from libc.stdlib cimport qsort
 from libc.string cimport memcpy
 from libc.string cimport memset
+from libc.stdio cimport printf
 
 import numpy as np
 cimport numpy as np
@@ -60,7 +61,7 @@ cdef class Splitter:
 
     def __cinit__(self, Criterion criterion, SIZE_t max_features,
                   SIZE_t min_samples_leaf, double min_weight_leaf,
-                  object random_state):
+                  object random_state, double eps, int verbose):
         """
         Parameters
         ----------
@@ -98,6 +99,9 @@ cdef class Splitter:
         self.min_samples_leaf = min_samples_leaf
         self.min_weight_leaf = min_weight_leaf
         self.random_state = random_state
+
+        self.eps = eps
+        self.verbose = verbose
 
     def __dealloc__(self):
         """Destructor."""
@@ -248,7 +252,7 @@ cdef class BaseDenseSplitter(Splitter):
 
     def __cinit__(self, Criterion criterion, SIZE_t max_features,
                   SIZE_t min_samples_leaf, double min_weight_leaf,
-                  object random_state):
+                  object random_state, double eps, int verbose):
 
         self.X_idx_sorted_ptr = NULL
         self.X_idx_sorted_stride = 0
@@ -472,6 +476,302 @@ cdef class BestSplitter(BaseDenseSplitter):
         split[0] = best
         n_constant_features[0] = n_total_constants
         return 0
+
+cdef class RobustSplitter(BaseDenseSplitter):
+    """Splitter for finding the robust split."""
+    def __reduce__(self):
+        return (RobustSplitter, (self.criterion,
+                               self.max_features,
+                               self.min_samples_leaf,
+                               self.min_weight_leaf,
+                               self.random_state,
+                               self.eps,
+                               self.verbose), self.__getstate__())
+
+    cdef int node_split(self, double impurity, SplitRecord* split,
+                        SIZE_t* n_constant_features) nogil except -1:
+        """Find the robust split on node samples[start:end]
+
+        Returns -1 in case of failure to allocate memory (and raise MemoryError)
+        or 0 otherwise.
+        """
+        # Find the robust split
+        cdef SIZE_t* samples = self.samples
+        cdef SIZE_t start = self.start
+        cdef SIZE_t end = self.end
+
+        cdef SIZE_t* features = self.features
+        cdef SIZE_t* constant_features = self.constant_features
+        cdef SIZE_t n_features = self.n_features
+
+        cdef DTYPE_t* Xf = self.feature_values
+        cdef SIZE_t max_features = self.max_features
+        cdef SIZE_t min_samples_leaf = self.min_samples_leaf
+        cdef double min_weight_leaf = self.min_weight_leaf
+        cdef UINT32_t* random_state = &self.rand_r_state
+
+        cdef INT32_t* X_idx_sorted = self.X_idx_sorted_ptr
+        cdef SIZE_t* sample_mask = self.sample_mask
+
+        cdef SplitRecord best, current
+        cdef double current_proxy_improvement = -INFINITY
+        cdef double left_proxy_improvement = -INFINITY
+        cdef double right_proxy_improvement = -INFINITY
+        cdef double best_proxy_improvement = -INFINITY
+
+        cdef SIZE_t f_i = n_features
+        cdef SIZE_t f_j
+        cdef SIZE_t p
+        # p_right: the first that's >= Xf[p] + eps
+        cdef SIZE_t p_right
+        # p_left: the first one that's >= Xf[p] - eps
+        cdef SIZE_t p_left
+        cdef SIZE_t feature_idx_offset
+        cdef SIZE_t feature_offset
+        cdef SIZE_t i
+        cdef SIZE_t j
+        cdef SIZE_t s
+        cdef SIZE_t t
+
+        cdef SIZE_t n_visited_features = 0
+        # Number of features discovered to be constant during the split search
+        cdef SIZE_t n_found_constants = 0
+        # Number of features known to be constant and drawn without replacement
+        cdef SIZE_t n_drawn_constants = 0
+        cdef SIZE_t n_known_constants = n_constant_features[0]
+        # n_total_constants = n_known_constants + n_found_constants
+        cdef SIZE_t n_total_constants = n_known_constants
+        cdef DTYPE_t current_feature_value
+        cdef SIZE_t partition_end
+
+        # count uncertain points put to the left and right
+        cdef SIZE_t n_put_left = 0
+        cdef SIZE_t n_put_right = 0
+
+        _init_split(&best, end)
+
+        # Sample up to max_features without replacement using a
+        # Fisher-Yates-based algorithm (using the local variables `f_i` and
+        # `f_j` to compute a permutation of the `features` array).
+        #
+        # Skip the CPU intensive evaluation of the impurity criterion for
+        # features that were already detected as constant (hence not suitable
+        # for good splitting) by ancestor nodes and save the information on
+        # newly discovered constant features to spare computation on descendant
+        # nodes.
+        while (f_i > n_total_constants and  # Stop early if remaining features
+                                            # are constant
+                (n_visited_features < max_features or
+                 # At least one drawn features must be non constant
+                 n_visited_features <= n_found_constants + n_drawn_constants)):
+
+            n_visited_features += 1
+
+            # Loop invariant: elements of features in
+            # - [:n_drawn_constant[ holds drawn and known constant features;
+            # - [n_drawn_constant:n_known_constant[ holds known constant
+            #   features that haven't been drawn yet;
+            # - [n_known_constant:n_total_constant[ holds newly found constant
+            #   features;
+            # - [n_total_constant:f_i[ holds features that haven't been drawn
+            #   yet and aren't constant apriori.
+            # - [f_i:n_features[ holds features that have been drawn
+            #   and aren't constant.
+
+            # Draw a feature at random
+            f_j = rand_int(n_drawn_constants, f_i - n_found_constants,
+                           random_state)
+
+            if f_j < n_known_constants:
+                # f_j in the interval [n_drawn_constants, n_known_constants[
+                features[n_drawn_constants], features[f_j] = features[f_j], features[n_drawn_constants]
+
+                n_drawn_constants += 1
+
+            else:
+                # f_j in the interval [n_known_constants, f_i - n_found_constants[
+                f_j += n_found_constants
+                # f_j in the interval [n_total_constants, f_i[
+                current.feature = features[f_j]
+                # Sort samples along that feature; by
+                # copying the values into an array and
+                # sorting the array in a manner which utilizes the cache more
+                # effectively.
+                for i in range(start, end):
+                    Xf[i] = self.X[samples[i], current.feature]
+                sort(Xf + start, samples + start, end - start)
+
+                if self.verbose:
+                    printf("\n******* Current Feature: %d Epsilon: %f *******\n", f_j, self.eps)
+                    printf("=== start: %d ===\n", start)
+                    for i in range(start, end):
+                        if Xf[i] != 0.0:
+                          printf("%f ", Xf[i])
+                    printf("\n")
+
+                if Xf[end - 1] <= Xf[start] + FEATURE_THRESHOLD:
+                    features[f_j], features[n_total_constants] = features[n_total_constants], features[f_j]
+
+                    n_found_constants += 1
+                    n_total_constants += 1
+
+                else:
+                    f_i -= 1
+                    features[f_i], features[f_j] = features[f_j], features[f_i]
+
+                    # Evaluate all splits in a robust way
+                    self.criterion.reset()
+                    p = start
+                    p_left = start
+                    p_right = start
+
+                    while p < end:
+                        while (p + 1 < end and
+                               Xf[p + 1] <= Xf[p] + FEATURE_THRESHOLD):
+                            p += 1
+
+                        # (p + 1 >= end) or (X[samples[p + 1], current.feature] >
+                        #                    X[samples[p], current.feature])
+                        p += 1
+                        # (p >= end) or (X[samples[p], current.feature] >
+                        #                X[samples[p - 1], current.feature])
+
+                        if p < end:
+                            current.pos = p
+                            n_put_left = 0
+                            n_put_right = 0
+
+                            # Compute uncertain indices range [p_left, p_right)
+                            # Xf[p_left] >= Xf[p] - eps
+                            for s in range(start, p+1):
+                                if Xf[s] >= Xf[p] - self.eps:
+                                    p_left = s
+                                    break
+
+                            p_right = p
+                            # Xf[p_right] >= Xf[p] + eps
+                            for t in range(p, end):
+                                if Xf[t] >= Xf[p] + self.eps:
+                                    p_right = t
+                                    break
+
+                            if Xf[end-1] < Xf[p] + self.eps:
+                                p_right = end
+
+                            if self.verbose:
+                                printf("Current p: %d\t\tCertain left: [%d, %d)\t\t\t\tUncertain [%d, %d)\t\t\t\tCertain right: [%d, %d)\n", p, start, p_left, p_left, p_right, p_right, end)
+                                printf("Values p: %f\tCertain left: [%f, %f)\tUncertain [%f, %f)\tCertain right: [%f, %f]\n", Xf[p], Xf[start], Xf[p_left], Xf[p_left], Xf[p_right], Xf[p_right], Xf[end-1])
+
+                            # Get stats for certain left and certain right
+                            # label counts: sum_newleft, sum_newright
+                            # weighted count: weighted_n_newleft, weighted_n_newright
+                            self.criterion.update_all(current.pos, p_left, p_right)
+
+                            #if self.verbose:
+                            #    printf("Greedy solution: ")
+
+                            # best: max min impurity reduction
+                            # uncertain indices are [p_left, p_right)
+                            for i in range(p_left, p_right):
+                                # current feature value is Xf[i].
+                                # try put to the left
+                                self.criterion.add_one(0, i)
+                                left_proxy_improvement = self.criterion.robust_proxy_impurity_improvement()
+                                self.criterion.remove_one(0, i)
+
+                                # try put to the right
+                                self.criterion.add_one(1, i)
+                                right_proxy_improvement = self.criterion.robust_proxy_impurity_improvement()
+                                self.criterion.remove_one(1, i)
+
+                                # greedily put to the side with smaller improvement
+                                if left_proxy_improvement > right_proxy_improvement:
+                                    # put to the right
+                                    self.criterion.add_one(1, i)
+                                    n_put_right += 1
+                                    #if self.verbose:
+                                    #    printf("0 ")
+                                else:
+                                    # put to the left
+                                    self.criterion.add_one(0, i)
+                                    n_put_left += 1
+                                    #if self.verbose:
+                                    #    printf("1 ")
+
+                            # Reject if min_samples_leaf is not guaranteed
+                            if (((p_left - start + n_put_left) < min_samples_leaf) or
+                              ((end - p_right + 1 + n_put_right) < min_samples_leaf)):
+                                continue
+
+                            #self.criterion.update(current.pos)
+
+                            # Reject if min_weight_leaf is not satisfied
+                            if ((self.criterion.weighted_n_newleft < min_weight_leaf) or
+                                    (self.criterion.weighted_n_newright < min_weight_leaf)):
+                                continue
+
+                            if self.verbose:
+                                printf("\n")
+                                printf("Regular impurity improvement: %f, robust impurity improvement: %f\n",
+                                  self.criterion.impurity_improvement(impurity),
+                                  self.criterion.robust_impurity_improvement(impurity))
+
+                            current_proxy_improvement = self.criterion.robust_proxy_impurity_improvement()
+
+                            if current_proxy_improvement > best_proxy_improvement:
+                                best_proxy_improvement = current_proxy_improvement
+                                # sum of halves is used to avoid infinite value
+                                current.threshold = Xf[p - 1] / 2.0 + Xf[p] / 2.0
+
+                                if ((current.threshold == Xf[p]) or
+                                    (current.threshold == INFINITY) or
+                                    (current.threshold == -INFINITY)):
+                                    current.threshold = Xf[p - 1]
+
+                                best = current  # copy
+
+                                # also compute the actual impurity improvement
+                                best.improvement = self.criterion.robust_impurity_improvement(impurity)
+                                self.criterion.robust_children_impurity(&best.impurity_left,
+                                                                 &best.impurity_right)
+                                if self.verbose:
+                                    printf("New best impurity improvement: %f\n\n", best.improvement)
+
+        # Reorganize into samples[start:best.pos] + samples[best.pos:end]
+        if best.pos < end:
+            partition_end = end
+            p = start
+
+            while p < partition_end:
+                if self.X[samples[p], best.feature] <= best.threshold:
+                    p += 1
+
+                else:
+                    partition_end -= 1
+
+                    samples[p], samples[partition_end] = samples[partition_end], samples[p]
+
+            self.criterion.reset()
+            self.criterion.update(best.pos)
+            #best.improvement = self.criterion.robust_impurity_improvement(impurity)
+            #self.criterion.robust_children_impurity(&best.impurity_left,
+            #                                 &best.impurity_right)
+        # Respect invariant for constant features: the original order of
+        # element in features[:n_known_constants] must be preserved for sibling
+        # and child nodes
+        memcpy(features, constant_features, sizeof(SIZE_t) * n_known_constants)
+
+        # Copy newly found constant features
+        memcpy(constant_features + n_known_constants,
+               features + n_known_constants,
+               sizeof(SIZE_t) * n_found_constants)
+
+        # Return values
+        split[0] = best
+        n_constant_features[0] = n_total_constants
+        return 0
+
+
 
 
 # Sort n-element arrays pointed to by Xf and samples, simultaneously,

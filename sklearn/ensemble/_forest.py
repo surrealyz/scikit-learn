@@ -895,12 +895,19 @@ class RandomForestClassifier(ForestClassifier):
 
     Parameters
     ----------
+
     n_estimators : int, default=100
         The number of trees in the forest.
 
         .. versionchanged:: 0.22
            The default value of ``n_estimators`` changed from 10 to 100
            in 0.22.
+
+    robust: boolean, optional (default=False)
+
+    epsilon: float, optional (default=0.0)
+
+    splitter: string, optional (default="best")
 
     criterion : {"gini", "entropy"}, default="gini"
         The function to measure the quality of a split. Supported criteria are
@@ -1152,6 +1159,9 @@ class RandomForestClassifier(ForestClassifier):
     @_deprecate_positional_args
     def __init__(self,
                  n_estimators=100, *,
+                 robust=False,
+                 epsilon=0.0,
+                 splitter="best",
                  criterion="gini",
                  max_depth=None,
                  min_samples_split=2,
@@ -1173,7 +1183,7 @@ class RandomForestClassifier(ForestClassifier):
         super().__init__(
             base_estimator=DecisionTreeClassifier(),
             n_estimators=n_estimators,
-            estimator_params=("criterion", "max_depth", "min_samples_split",
+            estimator_params=("robust", "epsilon", "verbose", "criterion", "splitter", "max_depth", "min_samples_split",
                               "min_samples_leaf", "min_weight_fraction_leaf",
                               "max_features", "max_leaf_nodes",
                               "min_impurity_decrease", "min_impurity_split",
@@ -1187,6 +1197,9 @@ class RandomForestClassifier(ForestClassifier):
             class_weight=class_weight,
             max_samples=max_samples)
 
+        self.robust = robust
+        self.epsilon = epsilon
+        self.splitter = splitter
         self.criterion = criterion
         self.max_depth = max_depth
         self.min_samples_split = min_samples_split

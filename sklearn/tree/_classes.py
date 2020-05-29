@@ -65,10 +65,12 @@ CRITERIA_REG = {"mse": _criterion.MSE, "friedman_mse": _criterion.FriedmanMSE,
                 "mae": _criterion.MAE}
 
 DENSE_SPLITTERS = {"best": _splitter.BestSplitter,
-                   "random": _splitter.RandomSplitter}
+                   "random": _splitter.RandomSplitter,
+                   "robust": _splitter.RobustSplitter}
 
 SPARSE_SPLITTERS = {"best": _splitter.BestSparseSplitter,
-                    "random": _splitter.RandomSparseSplitter}
+                    "random": _splitter.RandomSparseSplitter,
+                    "robust": _splitter.RobustSplitter} ### TODO: temp
 
 # =============================================================================
 # Base decision tree
@@ -85,6 +87,9 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
     @abstractmethod
     @_deprecate_positional_args
     def __init__(self, *,
+                 robust,
+                 epsilon,
+                 verbose,
                  criterion,
                  splitter,
                  max_depth,
@@ -98,6 +103,9 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
                  min_impurity_split,
                  class_weight=None,
                  ccp_alpha=0.0):
+        self.robust = robust
+        self.epsilon = epsilon
+        self.verbose = verbose
         self.criterion = criterion
         self.splitter = splitter
         self.max_depth = max_depth
@@ -331,11 +339,22 @@ class BaseDecisionTree(MultiOutputMixin, BaseEstimator, metaclass=ABCMeta):
 
         splitter = self.splitter
         if not isinstance(self.splitter, Splitter):
-            splitter = SPLITTERS[self.splitter](criterion,
-                                                self.max_features_,
-                                                min_samples_leaf,
-                                                min_weight_leaf,
-                                                random_state)
+            if self.robust is True:
+                splitter = SPLITTERS[self.splitter](criterion,
+                                                    self.max_features_,
+                                                    min_samples_leaf,
+                                                    min_weight_leaf,
+                                                    random_state,
+                                                    self.epsilon,
+                                                    self.verbose)
+            else:
+                splitter = SPLITTERS[self.splitter](criterion,
+                                                    self.max_features_,
+                                                    min_samples_leaf,
+                                                    min_weight_leaf,
+                                                    random_state,
+                                                    0.0,
+                                                    self.verbose)
 
         if is_classifier(self):
             self.tree_ = Tree(self.n_features_,
@@ -592,7 +611,14 @@ class DecisionTreeClassifier(ClassifierMixin, BaseDecisionTree):
 
     Parameters
     ----------
-    criterion : {"gini", "entropy"}, default="gini"
+    robust: boolean, optional (default=False)
+
+    epsilon: float, optional (default=0.0)
+
+    verbose : int, optional (default=0)
+        Controls the verbosity when fitting and predicting.
+
+    criterion : {"gini", "entropy"}, (default="gini")
         The function to measure the quality of a split. Supported criteria are
         "gini" for the Gini impurity and "entropy" for the information gain.
 
@@ -805,6 +831,9 @@ class DecisionTreeClassifier(ClassifierMixin, BaseDecisionTree):
     """
     @_deprecate_positional_args
     def __init__(self, *,
+                 robust=False,
+                 epsilon=0.0,
+                 verbose=0,
                  criterion="gini",
                  splitter="best",
                  max_depth=None,
@@ -819,6 +848,9 @@ class DecisionTreeClassifier(ClassifierMixin, BaseDecisionTree):
                  class_weight=None,
                  ccp_alpha=0.0):
         super().__init__(
+            robust=robust,
+            epsilon=epsilon,
+            verbose=verbose,
             criterion=criterion,
             splitter=splitter,
             max_depth=max_depth,

@@ -31,6 +31,8 @@ cdef class Criterion:
     cdef SIZE_t start                    # samples[start:pos] are the samples in the left node
     cdef SIZE_t pos                      # samples[pos:end] are the samples in the right node
     cdef SIZE_t end
+    cdef SIZE_t left_pos
+    cdef SIZE_t right_pos
 
     cdef SIZE_t n_outputs                # Number of outputs
     cdef SIZE_t n_samples                # Number of samples
@@ -39,6 +41,10 @@ cdef class Criterion:
     cdef double weighted_n_node_samples  # Weighted number of samples in the node
     cdef double weighted_n_left          # Weighted number of samples in the left node
     cdef double weighted_n_right         # Weighted number of samples in the right node
+    cdef double weighted_n_newleft
+    cdef double weighted_n_newright
+    cdef double weighted_n_certainleft
+    cdef double weighted_n_certainright
 
     cdef double* sum_total          # For classification criteria, the sum of the
                                     # weighted count of each label. For regression,
@@ -47,6 +53,10 @@ cdef class Criterion:
                                     # where k is output index.
     cdef double* sum_left           # Same as above, but for the left side of the split
     cdef double* sum_right          # same as above, but for the right side of the split
+    cdef double* sum_newleft
+    cdef double* sum_newright
+    cdef double* sum_certainleft
+    cdef double* sum_certainright
 
     # The criterion object is maintained such that left and right collected
     # statistics correspond to samples[start:pos] and samples[pos:end].
@@ -58,12 +68,20 @@ cdef class Criterion:
     cdef int reset(self) nogil except -1
     cdef int reverse_reset(self) nogil except -1
     cdef int update(self, SIZE_t new_pos) nogil except -1
+    cdef int update_all(self, SIZE_t new_pos, SIZE_t new_pos_left,
+                        SIZE_t new_post_right) nogil except -1
+    cdef int add_one(self, SIZE_t left_or_right, SIZE_t cur_idx) nogil except -1
+    cdef int remove_one(self, SIZE_t left_or_right, SIZE_t cur_idx) nogil except -1
     cdef double node_impurity(self) nogil
     cdef void children_impurity(self, double* impurity_left,
                                 double* impurity_right) nogil
+    cdef void robust_children_impurity(self, double* impurity_newleft,
+                                double* impurity_newright) nogil
     cdef void node_value(self, double* dest) nogil
     cdef double impurity_improvement(self, double impurity) nogil
+    cdef double robust_impurity_improvement(self, double impurity) nogil
     cdef double proxy_impurity_improvement(self) nogil
+    cdef double robust_proxy_impurity_improvement(self) nogil
 
 cdef class ClassificationCriterion(Criterion):
     """Abstract criterion for classification."""

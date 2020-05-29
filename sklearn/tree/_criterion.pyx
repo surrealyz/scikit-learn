@@ -21,6 +21,7 @@ from libc.stdlib cimport free
 from libc.string cimport memcpy
 from libc.string cimport memset
 from libc.math cimport fabs
+from libc.stdio cimport printf
 
 import numpy as np
 cimport numpy as np
@@ -109,6 +110,31 @@ cdef class Criterion:
 
         pass
 
+    cdef int update_all(self, SIZE_t new_pos, SIZE_t new_pos_left,
+                        SIZE_t new_post_right) nogil except -1:
+        """Updated statistics for the new position.
+        samples[new_pos_left:new_pos_right] are the uncertain indices.
+
+        It must be implemented by the subclass.
+
+        Parameters
+        ----------
+        new_pos : SIZE_t
+            New starting index position of the samples in the right child
+        new_pos_left : SIZE_t
+            New starting index position of the uncertain samples
+        new_post_right: SIZE_t
+            New ending index position of the uncertain samples (not included)
+        """
+
+        pass
+
+    cdef int add_one(self, SIZE_t left_or_right, SIZE_t cur_idx) nogil except -1:
+        pass
+
+    cdef int remove_one(self, SIZE_t left_or_right, SIZE_t cur_idx) nogil except -1:
+        pass
+
     cdef double node_impurity(self) nogil:
         """Placeholder for calculating the impurity of the node.
 
@@ -133,6 +159,25 @@ cdef class Criterion:
             The memory address where the impurity of the left child should be
             stored.
         impurity_right : double pointer
+            The memory address where the impurity of the right child should be
+            stored
+        """
+
+        pass
+
+    cdef void robust_children_impurity(self, double* impurity_newleft,
+                                double* impurity_newright) nogil:
+        """Placeholder for calculating the robust impurity of children.
+
+        Placeholder for a method which evaluates the impurity in
+        children nodes.s
+
+        Parameters
+        ----------
+        impurity_newleft : double pointer
+            The memory address where the impurity of the left child should be
+            stored.
+        impurity_newright : double pointer
             The memory address where the impurity of the right child should be
             stored
         """
@@ -171,6 +216,24 @@ cdef class Criterion:
         return (- self.weighted_n_right * impurity_right
                 - self.weighted_n_left * impurity_left)
 
+    cdef double robust_proxy_impurity_improvement(self) nogil:
+        """Compute a proxy of the robust impurity reduction
+
+        This method is used to speed up the search for the best split.
+        It is a proxy quantity such that the split that maximizes this value
+        also maximizes the impurity improvement. It neglects all constant terms
+        of the impurity decrease for a given split.
+
+        The absolute robust impurity improvement is only computed by the
+        robust_impurity_improvement method once the best split has been found.
+        """
+        cdef double impurity_newleft
+        cdef double impurity_newright
+        self.robust_children_impurity(&impurity_newleft, &impurity_newright)
+
+        return (- self.weighted_n_newright * impurity_newright
+                - self.weighted_n_newleft * impurity_newleft)
+
     cdef double impurity_improvement(self, double impurity) nogil:
         """Compute the improvement in impurity
 
@@ -200,10 +263,44 @@ cdef class Criterion:
         self.children_impurity(&impurity_left, &impurity_right)
 
         return ((self.weighted_n_node_samples / self.weighted_n_samples) *
-                (impurity - (self.weighted_n_right / 
+                (impurity - (self.weighted_n_right /
                              self.weighted_n_node_samples * impurity_right)
-                          - (self.weighted_n_left / 
+                          - (self.weighted_n_left /
                              self.weighted_n_node_samples * impurity_left)))
+
+    cdef double robust_impurity_improvement(self, double impurity) nogil:
+       """Compute the robust improvement in impurity
+
+       This method computes the improvement in impurity when a split occurs.
+       The weighted impurity improvement equation is the following:
+
+           N_t / N * (impurity - N_t_R / N_t * right_impurity
+                               - N_t_L / N_t * left_impurity)
+
+       where N is the total number of samples, N_t is the number of samples
+       at the current node, N_t_L is the number of samples in the left child,
+       and N_t_R is the number of samples in the right child,
+
+       Parameters
+       ----------
+       impurity : double
+           The initial impurity of the node before the split
+
+       Return
+       ------
+       double : improvement in impurity after the split occurs
+       """
+
+       cdef double impurity_newleft
+       cdef double impurity_newright
+
+       self.robust_children_impurity(&impurity_newleft, &impurity_newright)
+
+       return ((self.weighted_n_node_samples / self.weighted_n_samples) *
+               (impurity - (self.weighted_n_newright /
+                            self.weighted_n_node_samples * impurity_newright)
+                         - (self.weighted_n_newleft /
+                            self.weighted_n_node_samples * impurity_newleft)))
 
 
 cdef class ClassificationCriterion(Criterion):
@@ -227,6 +324,8 @@ cdef class ClassificationCriterion(Criterion):
         self.start = 0
         self.pos = 0
         self.end = 0
+        self.left_pos = 0
+        self.right_pos = 0
 
         self.n_outputs = n_outputs
         self.n_samples = 0
@@ -234,11 +333,21 @@ cdef class ClassificationCriterion(Criterion):
         self.weighted_n_node_samples = 0.0
         self.weighted_n_left = 0.0
         self.weighted_n_right = 0.0
+        # Count statistics for the final new left/right
+        # Initially, newleft is certain left, newright is certain right
+        self.weighted_n_newleft = 0.0
+        self.weighted_n_newright = 0.0
+        self.weighted_n_certainleft = 0.0
+        self.weighted_n_certainright = 0.0
 
         # Count labels for each output
         self.sum_total = NULL
         self.sum_left = NULL
         self.sum_right = NULL
+        self.sum_newleft = NULL
+        self.sum_newright = NULL
+        self.sum_certainleft = NULL
+        self.sum_certainright = NULL
         self.n_classes = NULL
 
         safe_realloc(&self.n_classes, n_outputs)
@@ -260,10 +369,18 @@ cdef class ClassificationCriterion(Criterion):
         self.sum_total = <double*> calloc(n_elements, sizeof(double))
         self.sum_left = <double*> calloc(n_elements, sizeof(double))
         self.sum_right = <double*> calloc(n_elements, sizeof(double))
+        self.sum_newleft = <double*> calloc(n_elements, sizeof(double))
+        self.sum_newright = <double*> calloc(n_elements, sizeof(double))
+        self.sum_certainleft = <double*> calloc(n_elements, sizeof(double))
+        self.sum_certainright = <double*> calloc(n_elements, sizeof(double))
 
         if (self.sum_total == NULL or
                 self.sum_left == NULL or
-                self.sum_right == NULL):
+                self.sum_right == NULL or
+                self.sum_newleft == NULL or
+                self.sum_newright == NULL or
+                self.sum_certainleft == NULL or
+                self.sum_certainright == NULL):
             raise MemoryError()
 
     def __dealloc__(self):
@@ -350,24 +467,42 @@ cdef class ClassificationCriterion(Criterion):
         or 0 otherwise.
         """
         self.pos = self.start
+        self.left_pos = self.start
+        self.right_pos = self.start
 
         self.weighted_n_left = 0.0
         self.weighted_n_right = self.weighted_n_node_samples
+        self.weighted_n_newleft = 0.0
+        self.weighted_n_newright = self.weighted_n_node_samples
+        self.weighted_n_certainleft = 0.0
+        self.weighted_n_certainright = self.weighted_n_node_samples
 
         cdef double* sum_total = self.sum_total
         cdef double* sum_left = self.sum_left
+        cdef double* sum_newleft = self.sum_newleft
+        cdef double* sum_certainleft = self.sum_certainleft
         cdef double* sum_right = self.sum_right
+        cdef double* sum_newright = self.sum_newright
+        cdef double* sum_certainright = self.sum_certainright
 
         cdef SIZE_t* n_classes = self.n_classes
         cdef SIZE_t k
 
         for k in range(self.n_outputs):
             memset(sum_left, 0, n_classes[k] * sizeof(double))
+            memset(sum_newleft, 0, n_classes[k] * sizeof(double))
+            memset(sum_certainleft, 0, n_classes[k] * sizeof(double))
             memcpy(sum_right, sum_total, n_classes[k] * sizeof(double))
+            memcpy(sum_newright, sum_total, n_classes[k] * sizeof(double))
+            memcpy(sum_certainright, sum_total, n_classes[k] * sizeof(double))
 
             sum_total += self.sum_stride
             sum_left += self.sum_stride
+            sum_newleft += self.sum_stride
+            sum_certainleft += self.sum_stride
             sum_right += self.sum_stride
+            sum_newright += self.sum_stride
+            sum_certainright += self.sum_stride
         return 0
 
     cdef int reverse_reset(self) nogil except -1:
@@ -474,6 +609,214 @@ cdef class ClassificationCriterion(Criterion):
             sum_total += self.sum_stride
 
         self.pos = new_pos
+        return 0
+
+    cdef int update_all(self, SIZE_t new_pos, SIZE_t new_left_pos,
+                        SIZE_t new_right_pos) nogil except -1:
+        """Updated statistics for the new position.
+        samples[new_pos_left:new_pos_right] are the uncertain indices.
+
+        Returns -1 in case of failure to allocate memory (and raise MemoryError)
+        or 0 otherwise.
+
+        Parameters
+        ----------
+        new_pos : SIZE_t
+            New starting index position of the samples in the right child
+        new_pos_left : SIZE_t
+            New starting index position of the uncertain samples
+        new_post_right: SIZE_t
+            New ending index position of the uncertain samples (not included)
+        """
+        cdef SIZE_t pos = self.pos
+        cdef SIZE_t end = self.end
+        cdef SIZE_t left_pos = self.left_pos
+        cdef SIZE_t right_pos = self.right_pos
+
+        cdef double* sum_left = self.sum_left
+        cdef double* sum_right = self.sum_right
+        cdef double* sum_total = self.sum_total
+        cdef double* sum_newleft = self.sum_newleft
+        cdef double* sum_newright = self.sum_newright
+        cdef double* sum_certainleft = self.sum_certainleft
+        cdef double* sum_certainright = self.sum_certainright
+
+        cdef SIZE_t* n_classes = self.n_classes
+        cdef SIZE_t* samples = self.samples
+        cdef DOUBLE_t* sample_weight = self.sample_weight
+
+        cdef SIZE_t i
+        cdef SIZE_t p
+        cdef SIZE_t k
+        cdef SIZE_t c
+        cdef SIZE_t label_index
+        cdef DOUBLE_t w = 1.0
+
+        # Update statistics
+        #
+        # Given that
+        #   sum_newleft[x] + sum_uncertain[x] + sum_newright[x] = sum_total[x]
+        # Will update sum_newleft and sum_newright.
+
+        # Xf[left_pos] <= Xf[pos] - eps
+        # Xf[right_pos] > Xf[pos] + eps
+        # Uncertain range [left_pos, right_pos)
+        #printf("\tsum_certainleft + [%d, %d)\t\tsum_certainright - [%d, %d)\n\n",
+        #    left_pos, new_left_pos,right_pos, new_right_pos)
+        for p in range(left_pos, new_left_pos):
+            i = samples[p]
+
+            if sample_weight != NULL:
+                w = sample_weight[i]
+
+            for k in range(self.n_outputs):
+                label_index = k * self.sum_stride + <SIZE_t> self.y[i, k]
+                sum_certainleft[label_index] += w
+
+            self.weighted_n_certainleft += w
+
+        for p in range(right_pos, new_right_pos):
+            i = samples[p]
+
+            if sample_weight != NULL:
+                w = sample_weight[i]
+
+            for k in range(self.n_outputs):
+                label_index = k * self.sum_stride + <SIZE_t> self.y[i, k]
+                sum_certainright[label_index] -= w
+
+            self.weighted_n_certainright -= w
+
+        self.left_pos = new_left_pos
+        self.right_pos = new_right_pos
+
+        # copy the certainleft to newleft. copy the certainright to newright.
+        for k in range(self.n_outputs):
+            memcpy(sum_newleft, sum_certainleft, n_classes[k] * sizeof(double))
+            memcpy(sum_newright, sum_certainright, n_classes[k] * sizeof(double))
+        self.weighted_n_newleft = self.weighted_n_certainleft
+        self.weighted_n_newright = self.weighted_n_certainright
+
+        # Below are the regular stats
+        if (new_pos - pos) <= (end - new_pos):
+            for p in range(pos, new_pos):
+                i = samples[p]
+
+                if sample_weight != NULL:
+                    w = sample_weight[i]
+
+                for k in range(self.n_outputs):
+                    label_index = k * self.sum_stride + <SIZE_t> self.y[i, k]
+                    sum_left[label_index] += w
+
+                self.weighted_n_left += w
+
+        else:
+            self.reverse_reset()
+
+            for p in range(end - 1, new_pos - 1, -1):
+                i = samples[p]
+
+                if sample_weight != NULL:
+                    w = sample_weight[i]
+
+                for k in range(self.n_outputs):
+                    label_index = k * self.sum_stride + <SIZE_t> self.y[i, k]
+                    sum_left[label_index] -= w
+
+                self.weighted_n_left -= w
+
+        # Update right part statistics
+        self.weighted_n_right = self.weighted_n_node_samples - self.weighted_n_left
+        for k in range(self.n_outputs):
+            for c in range(n_classes[k]):
+                sum_right[c] = sum_total[c] - sum_left[c]
+
+            sum_right += self.sum_stride
+            sum_left += self.sum_stride
+            sum_total += self.sum_stride
+
+        self.pos = new_pos
+        return 0
+
+    cdef int add_one(self, SIZE_t left_or_right, SIZE_t cur_idx) nogil except -1:
+        cdef double* sum_newleft = self.sum_newleft
+        cdef double* sum_newright = self.sum_newright
+
+        cdef SIZE_t* samples = self.samples
+        cdef DOUBLE_t* sample_weight = self.sample_weight
+
+        cdef SIZE_t i
+        cdef SIZE_t k
+        cdef SIZE_t label_index
+        cdef DOUBLE_t w = 1.0
+
+        if left_or_right == 0:
+            # left
+            # self.sum_newleft and self.weighted_n_newleft
+            i = samples[cur_idx]
+
+            if sample_weight != NULL:
+                w = sample_weight[i]
+
+            for k in range(self.n_outputs):
+                label_index = k * self.sum_stride + <SIZE_t> self.y[i, k]
+                sum_newleft[label_index] += w
+
+            self.weighted_n_newleft += w
+        else:
+            # right
+            # self.sum_newright and self.weighted_n_newright
+            i = samples[cur_idx]
+
+            if sample_weight != NULL:
+                w = sample_weight[i]
+
+            for k in range(self.n_outputs):
+                label_index = k * self.sum_stride + <SIZE_t> self.y[i, k]
+                sum_newright[label_index] += w
+
+            self.weighted_n_newright += w
+        return 0
+
+    cdef int remove_one(self, SIZE_t left_or_right, SIZE_t cur_idx) nogil except -1:
+        cdef double* sum_newleft = self.sum_newleft
+        cdef double* sum_newright = self.sum_newright
+
+        cdef SIZE_t* samples = self.samples
+        cdef DOUBLE_t* sample_weight = self.sample_weight
+
+        cdef SIZE_t i
+        cdef SIZE_t k
+        cdef SIZE_t label_index
+        cdef DOUBLE_t w = 1.0
+
+        if left_or_right == 0:
+            # left
+            # self.sum_newleft and self.weighted_n_newleft
+            i = samples[cur_idx]
+
+            if sample_weight != NULL:
+                w = sample_weight[i]
+
+            for k in range(self.n_outputs):
+                label_index = k * self.sum_stride + <SIZE_t> self.y[i, k]
+                sum_newleft[label_index] -= w
+
+            self.weighted_n_newleft -= w
+        else:
+            # right
+            # self.sum_newright and self.weighted_n_newright
+            i = samples[cur_idx]
+
+            if sample_weight != NULL:
+                w = sample_weight[i]
+
+            for k in range(self.n_outputs):
+                label_index = k * self.sum_stride + <SIZE_t> self.y[i, k]
+                sum_newright[label_index] -= w
+
+            self.weighted_n_newright -= w
         return 0
 
     cdef double node_impurity(self) nogil:
@@ -676,6 +1019,51 @@ cdef class Gini(ClassificationCriterion):
         impurity_left[0] = gini_left / self.n_outputs
         impurity_right[0] = gini_right / self.n_outputs
 
+    cdef void robust_children_impurity(self, double* impurity_newleft,
+                                double* impurity_newright) nogil:
+        """Evaluate the impurity in children nodes
+
+        Parameters
+        ----------
+        impurity_newleft : double pointer
+            The memory address to save the impurity of the left node to
+        impurity_newright : double pointer
+            The memory address to save the impurity of the right node to
+        """
+
+        cdef SIZE_t* n_classes = self.n_classes
+        cdef double* sum_newleft = self.sum_newleft
+        cdef double* sum_newright = self.sum_newright
+        cdef double gini_newleft = 0.0
+        cdef double gini_newright = 0.0
+        cdef double sq_count_left
+        cdef double sq_count_right
+        cdef double count_k
+        cdef SIZE_t k
+        cdef SIZE_t c
+
+        for k in range(self.n_outputs):
+            sq_count_left = 0.0
+            sq_count_right = 0.0
+
+            for c in range(n_classes[k]):
+                count_k = sum_newleft[c]
+                sq_count_left += count_k * count_k
+
+                count_k = sum_newright[c]
+                sq_count_right += count_k * count_k
+
+            gini_newleft += 1.0 - sq_count_left / (self.weighted_n_newleft *
+                                                self.weighted_n_newleft)
+
+            gini_newright += 1.0 - sq_count_right / (self.weighted_n_newright *
+                                                  self.weighted_n_newright)
+
+            sum_newleft += self.sum_stride
+            sum_newright += self.sum_stride
+
+        impurity_newleft[0] = gini_newleft / self.n_outputs
+        impurity_newright[0] = gini_newright / self.n_outputs
 
 cdef class RegressionCriterion(Criterion):
     r"""Abstract regression criterion.
@@ -729,7 +1117,7 @@ cdef class RegressionCriterion(Criterion):
         self.sum_left = <double*> calloc(n_outputs, sizeof(double))
         self.sum_right = <double*> calloc(n_outputs, sizeof(double))
 
-        if (self.sum_total == NULL or 
+        if (self.sum_total == NULL or
                 self.sum_left == NULL or
                 self.sum_right == NULL):
             raise MemoryError()
@@ -1251,7 +1639,7 @@ cdef class MAE(RegressionCriterion):
                     w = sample_weight[i]
 
                 impurity_left += fabs(self.y[i, k] - median) * w
-        p_impurity_left[0] = impurity_left / (self.weighted_n_left * 
+        p_impurity_left[0] = impurity_left / (self.weighted_n_left *
                                               self.n_outputs)
 
         for k in range(self.n_outputs):
@@ -1263,7 +1651,7 @@ cdef class MAE(RegressionCriterion):
                     w = sample_weight[i]
 
                 impurity_right += fabs(self.y[i, k] - median) * w
-        p_impurity_right[0] = impurity_right / (self.weighted_n_right * 
+        p_impurity_right[0] = impurity_right / (self.weighted_n_right *
                                                 self.n_outputs)
 
 
